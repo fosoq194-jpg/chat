@@ -65,9 +65,20 @@ def init_database():
                 sender TEXT NOT NULL,
                 user_id INTEGER,
                 message TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
                 timestamp REAL NOT NULL
             )
         """)
+
+        message_columns = {
+            row["name"]
+            for row in db.execute("PRAGMA table_info(messages)").fetchall()
+        }
+
+        if "role" not in message_columns:
+            db.execute(
+                "ALTER TABLE messages ADD COLUMN role TEXT NOT NULL DEFAULT 'user'"
+            )
 
         db.execute("""
             CREATE INDEX IF NOT EXISTS idx_messages_timestamp
@@ -75,12 +86,44 @@ def init_database():
         """)
 
         db.execute("""
+            CREATE TABLE IF NOT EXISTS reactions (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                reaction TEXT NOT NULL,
+                timestamp REAL NOT NULL
+            )
+        """)
+
+        db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_reaction_unique
+            ON reactions(message_id, user_id, reaction)
+        """)
+
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_reactions_timestamp
+            ON reactions(timestamp)
+        """)
+
+        # Migrate old presence table from user_id-keyed rows to
+        # session_id-keyed rows so two devices/accounts can coexist.
+        presence_columns = {
+            row["name"]
+            for row in db.execute("PRAGMA table_info(presence)").fetchall()
+        }
+
+        if presence_columns and "session_id" not in presence_columns:
+            db.execute("ALTER TABLE presence RENAME TO presence_legacy")
+
+        db.execute("""
             CREATE TABLE IF NOT EXISTS presence (
-                user_id INTEGER PRIMARY KEY,
+                session_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
                 username TEXT NOT NULL,
                 place_id INTEGER,
                 job_id TEXT,
                 place_name TEXT,
+                device TEXT,
                 x REAL,
                 y REAL,
                 z REAL,
@@ -95,6 +138,43 @@ def init_database():
             CREATE INDEX IF NOT EXISTS idx_presence_last_seen
             ON presence(last_seen)
         """)
+
+        if "presence_legacy" in {
+            row["name"] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }:
+            legacy_rows = db.execute(
+                "SELECT * FROM presence_legacy"
+            ).fetchall()
+
+            for row in legacy_rows:
+                legacy_session = f"legacy-{row['user_id']}"
+                db.execute("""
+                    INSERT OR IGNORE INTO presence (
+                        session_id, user_id, username, place_id, job_id,
+                        place_name, device, x, y, z, health, max_health,
+                        role, last_seen
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    legacy_session,
+                    row["user_id"],
+                    row["username"],
+                    row["place_id"],
+                    row["job_id"],
+                    row["place_name"],
+                    None,
+                    row["x"],
+                    row["y"],
+                    row["z"],
+                    row["health"],
+                    row["max_health"],
+                    row["role"],
+                    row["last_seen"],
+                ))
+
+            db.execute("DROP TABLE presence_legacy")
 
         db.commit()
 
@@ -113,16 +193,24 @@ class ChatMessage(BaseModel):
 
 
 class PresenceUpdate(BaseModel):
+    session_id: str = Field(..., min_length=8, max_length=64)
     username: str = Field(..., min_length=1, max_length=32)
     user_id: int
     place_id: Optional[int] = None
     job_id: Optional[str] = Field(default=None, max_length=64)
     place_name: Optional[str] = Field(default=None, max_length=100)
+    device: Optional[str] = Field(default=None, max_length=16)
     x: Optional[float] = None
     y: Optional[float] = None
     z: Optional[float] = None
     health: Optional[float] = None
     max_health: Optional[float] = None
+
+
+class ReactionRequest(BaseModel):
+    message_id: str = Field(..., min_length=1, max_length=64)
+    user_id: int
+    reaction: str = Field(..., min_length=1, max_length=8)
 
 
 # ============================================================
@@ -162,17 +250,20 @@ def row_to_message(row):
         "sender": row["sender"],
         "user_id": row["user_id"],
         "message": row["message"],
+        "role": row["role"],
         "timestamp": row["timestamp"],
     }
 
 
 def row_to_presence(row):
     return {
+        "session_id": row["session_id"],
         "user_id": row["user_id"],
         "username": row["username"],
         "place_id": row["place_id"],
         "job_id": row["job_id"],
         "place_name": row["place_name"] or "Unknown Place",
+        "device": row["device"] or "Desktop",
         "x": row["x"],
         "y": row["y"],
         "z": row["z"],
@@ -181,6 +272,27 @@ def row_to_presence(row):
         "role": row["role"],
         "last_seen": row["last_seen"],
     }
+
+
+def get_reaction_counts(db, message_ids):
+    if not message_ids:
+        return {}
+
+    placeholders = ",".join("?" for _ in message_ids)
+
+    rows = db.execute(f"""
+        SELECT message_id, reaction, COUNT(*) AS count
+        FROM reactions
+        WHERE message_id IN ({placeholders})
+        GROUP BY message_id, reaction
+    """, tuple(message_ids)).fetchall()
+
+    result = {message_id: {} for message_id in message_ids}
+
+    for row in rows:
+        result.setdefault(row["message_id"], {})[row["reaction"]] = int(row["count"])
+
+    return result
 
 
 # ============================================================
@@ -225,15 +337,25 @@ def get_chat(
 
     with closing(get_db()) as db:
         rows = db.execute("""
-            SELECT id, sender, user_id, message, timestamp
+            SELECT id, sender, user_id, message, role, timestamp
             FROM messages
             WHERE timestamp > ?
             ORDER BY timestamp ASC
         """, (after,)).fetchall()
 
+        ids = [row["id"] for row in rows]
+        reactions = get_reaction_counts(db, ids)
+
+    result = []
+
+    for row in rows:
+        item = row_to_message(row)
+        item["reactions"] = reactions.get(row["id"], {})
+        result.append(item)
+
     return {
         "success": True,
-        "messages": [row_to_message(row) for row in rows]
+        "messages": result
     }
 
 
@@ -254,26 +376,29 @@ def send_chat(
         raise HTTPException(status_code=400, detail="Empty message")
 
     now = time.time()
+    role = "dev" if data.user_id is not None and data.user_id in DEV_USER_IDS else "user"
 
     entry = {
         "id": uuid.uuid4().hex,
         "sender": sender[:32],
         "user_id": data.user_id,
         "message": message,
+        "role": role,
         "timestamp": now,
     }
 
     with closing(get_db()) as db:
         db.execute("""
             INSERT INTO messages (
-                id, sender, user_id, message, timestamp
+                id, sender, user_id, message, role, timestamp
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
         """, (
             entry["id"],
             entry["sender"],
             entry["user_id"],
             entry["message"],
+            entry["role"],
             entry["timestamp"],
         ))
         db.commit()
@@ -298,6 +423,122 @@ def clear_chat(
 
 
 # ============================================================
+# REACTIONS
+# ============================================================
+
+@app.post("/reactions")
+def toggle_reaction(
+    data: ReactionRequest,
+    x_api_key: Optional[str] = Header(default=None)
+):
+    check_api_key(x_api_key)
+
+    allowed = {"👍", "❤️", "😂", "😮", "🔥", "💀"}
+
+    if data.reaction not in allowed:
+        raise HTTPException(status_code=400, detail="Unsupported reaction")
+
+    now = time.time()
+
+    with closing(get_db()) as db:
+        message = db.execute(
+            "SELECT id FROM messages WHERE id = ?",
+            (data.message_id,)
+        ).fetchone()
+
+        if not message:
+            raise HTTPException(status_code=404, detail="Message not found")
+
+        existing = db.execute("""
+            SELECT id
+            FROM reactions
+            WHERE message_id = ?
+              AND user_id = ?
+              AND reaction = ?
+        """, (
+            data.message_id,
+            data.user_id,
+            data.reaction,
+        )).fetchone()
+
+        if existing:
+            action = "remove"
+
+            db.execute(
+                "DELETE FROM reactions WHERE id = ?",
+                (existing["id"],)
+            )
+        else:
+            action = "add"
+
+            db.execute("""
+                INSERT INTO reactions (
+                    id, message_id, user_id, reaction, timestamp
+                )
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                uuid.uuid4().hex,
+                data.message_id,
+                data.user_id,
+                data.reaction,
+                now,
+            ))
+
+        counts = db.execute("""
+            SELECT reaction, COUNT(*) AS count
+            FROM reactions
+            WHERE message_id = ?
+            GROUP BY reaction
+        """, (data.message_id,)).fetchall()
+
+        result_counts = {
+            row["reaction"]: int(row["count"])
+            for row in counts
+        }
+
+        db.commit()
+
+    return {
+        "success": True,
+        "message_id": data.message_id,
+        "reaction": data.reaction,
+        "action": action,
+        "timestamp": now,
+        "reactions": result_counts,
+    }
+
+
+@app.get("/reactions")
+def get_reactions(
+    after: float = Query(default=0, ge=0),
+    x_api_key: Optional[str] = Header(default=None)
+):
+    check_api_key(x_api_key)
+
+    with closing(get_db()) as db:
+        rows = db.execute("""
+            SELECT id, message_id, user_id, reaction, timestamp
+            FROM reactions
+            WHERE timestamp > ?
+            ORDER BY timestamp ASC
+        """, (after,)).fetchall()
+
+    return {
+        "success": True,
+        "events": [
+            {
+                "id": row["id"],
+                "message_id": row["message_id"],
+                "user_id": row["user_id"],
+                "reaction": row["reaction"],
+                "timestamp": row["timestamp"],
+            }
+            for row in rows
+        ]
+    }
+
+
+# ============================================================
 # PRESENCE
 # ============================================================
 
@@ -319,11 +560,13 @@ def update_presence(
     with closing(get_db()) as db:
         db.execute("""
             INSERT INTO presence (
+                session_id,
                 user_id,
                 username,
                 place_id,
                 job_id,
                 place_name,
+                device,
                 x,
                 y,
                 z,
@@ -332,12 +575,14 @@ def update_presence(
                 role,
                 last_seen
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                user_id = excluded.user_id,
                 username = excluded.username,
                 place_id = excluded.place_id,
                 job_id = excluded.job_id,
                 place_name = excluded.place_name,
+                device = excluded.device,
                 x = excluded.x,
                 y = excluded.y,
                 z = excluded.z,
@@ -346,11 +591,13 @@ def update_presence(
                 role = excluded.role,
                 last_seen = excluded.last_seen
         """, (
+            data.session_id,
             data.user_id,
             username[:32],
             data.place_id,
             data.job_id,
             (data.place_name or "Unknown Place")[:100],
+            (data.device or "Desktop")[:16],
             data.x,
             data.y,
             data.z,
@@ -359,10 +606,12 @@ def update_presence(
             role,
             now,
         ))
+
         db.commit()
 
     return {
         "success": True,
+        "session_id": data.session_id,
         "role": role,
         "last_seen": now,
     }
@@ -378,11 +627,13 @@ def get_presence(
     with closing(get_db()) as db:
         rows = db.execute("""
             SELECT
+                session_id,
                 user_id,
                 username,
                 place_id,
                 job_id,
                 place_name,
+                device,
                 x,
                 y,
                 z,
@@ -403,17 +654,17 @@ def get_presence(
     }
 
 
-@app.delete("/presence/{user_id}")
+@app.delete("/presence/{session_id}")
 def remove_presence(
-    user_id: int,
+    session_id: str,
     x_api_key: Optional[str] = Header(default=None)
 ):
     check_api_key(x_api_key)
 
     with closing(get_db()) as db:
         db.execute(
-            "DELETE FROM presence WHERE user_id = ?",
-            (user_id,)
+            "DELETE FROM presence WHERE session_id = ?",
+            (session_id,)
         )
         db.commit()
 
